@@ -1,0 +1,348 @@
+volumes:
+  n8n_db_postgres:
+    name: n8n_db_postgres
+  n8n_storage:
+    name: n8n_storage
+  n8n_redis_storage:
+    name: n8n_redis_storage
+  n8n_pgadmin:
+    name: n8n_pgadmin
+  backups:
+    name: backups
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./backups
+
+networks:
+  frontend-network:
+    name: frontend-network
+    driver: bridge
+  backend-network:
+    name: backend-network
+    driver: bridge
+  db-network:
+    name: db-network
+    driver: bridge
+
+# Definições de logging padrão
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Definições de recursos padrão
+x-resources: &default-resources
+  resources:
+    limits:
+      cpus: "1"
+      memory: 1G
+    reservations:
+      cpus: "0.25"
+      memory: 512M
+
+x-shared: &shared
+  image: docker.n8n.io/n8nio/n8n:1.89.2
+  restart: unless-stopped
+  volumes:
+    - n8n_storage:/home/node/.n8n
+    - ./local-files:/files
+    - ./local-files/logs:/files/logs
+  logging: *default-logging
+
+x-worker: &worker
+  <<: *shared
+  command: worker
+  networks:
+    - db-network
+    - backend-network
+  depends_on:
+    - n8n
+  deploy:
+    <<: *default-resources
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "ps",
+        "aux",
+        "|",
+        "grep",
+        "n8n",
+        "|",
+        "grep",
+        "worker",
+        "||",
+        "exit",
+        "1",
+      ]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+services:
+  postgres_n8n:
+    image: ${POSTGRES_IMAGE}
+    container_name: postgres_n8n
+    hostname: postgres_n8n
+    restart: unless-stopped
+    volumes:
+      - n8n_db_postgres:/var/lib/postgresql/data
+      - ./init-data.sh:/docker-entrypoint-initdb.d/init-data.sh
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_NON_ROOT_USER
+      - POSTGRES_NON_ROOT_PASSWORD
+      - PGDATA_CHECK
+      - PGDATA=/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - db-network
+      - backend-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging: *default-logging
+
+  postgres_backup:
+    image: ${POSTGRES_IMAGE}
+    container_name: postgres_backup
+    restart: unless-stopped
+    depends_on:
+      - postgres_n8n
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - BACKUP_RETENTION_DAYS=7
+    volumes:
+      - ./backups:/backups
+    entrypoint: >
+      /bin/sh -c "
+        while true; do
+          echo 'Starting backup...';
+          pg_dump -h postgres_n8n -U $${POSTGRES_USER} $${POSTGRES_DB} | gzip > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql.gz;
+          # Remove backups keeping only the 10 most recent
+          ls -t /backups/backup_*.sql.gz | tail -n +11 | xargs rm -f;
+          echo 'Old backups cleaned!';
+          echo 'Backup completed!';
+          sleep 86400; # 24 horas
+        done
+      "
+    networks:
+      - db-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    logging: *default-logging
+
+  n8n_pgadmin:
+    image: dpage/pgadmin4:9.1
+    container_name: n8n_pgadmin
+    restart: unless-stopped
+    depends_on:
+      - postgres_n8n
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    volumes:
+      - n8n_pgadmin:/var/lib/pgadmin
+    # Porta exposta para acesso via seu proxy reverso existente
+    ports:
+      - "8081:80"
+    networks:
+      - db-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    logging: *default-logging
+
+  redis_n8n:
+    image: redis:6-alpine
+    container_name: redis_n8n
+    hostname: redis_n8n
+    restart: unless-stopped
+    volumes:
+      - n8n_redis_storage:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    logging: *default-logging
+
+  n8n:
+    <<: *shared
+    container_name: n8n
+    hostname: n8n
+    security_opt:
+      - no-new-privileges=false
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_n8n
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_POSTGRESDB_SSL_MODE=disable
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_n8n
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - N8N_PROTOCOL=https
+      - N8N_RUNNERS_ENABLED=true
+      # - N8N_RUNNERS_MODE=main
+      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_LOG_LEVEL=info
+      # - EXECUTIONS_PROCESS=main
+      - N8N_LOG_FILE_LOCATION=/files/logs/n8n.log
+    ports:
+      - "5678:5678"
+    depends_on:
+      postgres_n8n:
+        condition: service_healthy
+      redis_n8n:
+        condition: service_healthy
+    networks:
+      - frontend-network
+      - backend-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  n8n_worker_01:
+    <<: *worker
+    container_name: n8n-worker-01
+    hostname: n8n-worker-01
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_n8n
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_POSTGRESDB_SSL_MODE=disable
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_n8n
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      # - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - N8N_PROTOCOL=https
+      - N8N_RUNNERS_ENABLED=true
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_FILE_LOCATION=/files/logs/n8n-worker-01.log
+
+  n8n_worker_02:
+    <<: *worker
+    container_name: n8n-worker-02
+    hostname: n8n-worker-02
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_n8n
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_POSTGRESDB_SSL_MODE=disable
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_n8n
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      # - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - N8N_PROTOCOL=https
+      - N8N_RUNNERS_ENABLED=true
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_FILE_LOCATION=/files/logs/n8n-worker-02.log
+
+  n8n_worker_03:
+    <<: *worker
+    container_name: n8n-worker-03
+    hostname: n8n-worker-03
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_n8n
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_POSTGRESDB_SSL_MODE=disable
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_n8n
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      # - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - N8N_PROTOCOL=https
+      - N8N_RUNNERS_ENABLED=true
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_FILE_LOCATION=/files/logs/n8n-worker-03.log

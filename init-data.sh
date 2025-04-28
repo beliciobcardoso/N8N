@@ -1,0 +1,39 @@
+#!/bin/bash
+echo "SETUP INFO: Running init-data.sh"
+set -e;
+
+if [ -n "${POSTGRES_NON_ROOT_USER:-}" ] && [ -n "${POSTGRES_NON_ROOT_PASSWORD:-}" ]; then
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    DO
+    \$\$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT FROM pg_catalog.pg_roles
+        WHERE rolname = '${POSTGRES_NON_ROOT_USER}'
+      ) THEN
+        CREATE ROLE ${POSTGRES_NON_ROOT_USER} LOGIN PASSWORD '${POSTGRES_NON_ROOT_PASSWORD}';
+      END IF;
+    END
+    \$\$;
+
+    -- Dá controle sobre o banco
+    GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${POSTGRES_NON_ROOT_USER};
+    GRANT CREATE ON SCHEMA public TO ${POSTGRES_NON_ROOT_USER};
+
+    -- Dá acesso às tabelas já existentes
+    GRANT USAGE ON SCHEMA public TO ${POSTGRES_NON_ROOT_USER};
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${POSTGRES_NON_ROOT_USER};
+    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${POSTGRES_NON_ROOT_USER};
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${POSTGRES_NON_ROOT_USER};
+
+    -- Garante que novas tabelas, sequências e funções também sejam automaticamente compartilhadas
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${POSTGRES_NON_ROOT_USER};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${POSTGRES_NON_ROOT_USER};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT EXECUTE ON FUNCTIONS TO ${POSTGRES_NON_ROOT_USER};
+EOSQL
+else
+  echo "SETUP INFO: No Environment variables given!"
+fi

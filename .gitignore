@@ -1,0 +1,5 @@
+/backups
+/logs
+/local-files
+
+/.env
