@@ -74,6 +74,6 @@ O serviço `postgres_backup` executa periodicamente:
 ---
 
 ### Observações
-- O backup é feito a cada 60 segundos (ajuste o tempo no `docker-compose.yml` conforme necessidade).
+- O backup é feito a cada 24 horas (ajuste o tempo no `docker-compose.yml` conforme necessidade).
 - O script `init-data.sh` só executa na primeira inicialização do banco.
 - Para restaurar um backup, utilize o comando `pg_restore` ou `psql` manualmente.
